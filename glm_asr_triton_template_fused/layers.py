@@ -182,59 +182,45 @@ def linear_kernel_tf32(
     a_ptr,
     b_ptr,
     c_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
+    bias_ptr,                  # 新增
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    HAS_BIAS: tl.constexpr,    # 新增，编译期常量
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
-    """
-    TF32-style matmul: output = A @ B.
-    A: (M, K), B: (K, N), C: (M, N)
-
-    *** TODO: Implement this kernel ***
-
-    Grid: (M // BLOCK_M, N // BLOCK_N)
-    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement tiled matrix multiplication
-    # ============================================================================
-    #
-    # Step 1: Initialize accumulator
-    # Step 2: Loop over K tiles and accumulate tl.dot
-    # Step 3: Store the result
-
-    offs_m = pid_m * BLOCK_M+tl.arange(0,BLOCK_M)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
+
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
     for k in range(0, K, BLOCK_K):
-            a = tl.load(
-                a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-                mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
-                other=0.0,
-            )
-            b = tl.load(
-                b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
-                mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-                other=0.0,
-            )
-            acc += tl.dot(a, b)
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+        a_mask = (offs_m[:, None] < M) & (k + offs_k[None, :] < K)
+        b_mask = (k + offs_k[:, None] < K) & (offs_n[None, :] < N)
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # 融合 bias 加法
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        acc += bias[None, :]
+
+    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
     
 
 
@@ -546,7 +532,83 @@ def causal_mask_kernel(
         scores,
         mask=mask,
     )
+# ============================================================================
+# Original Optimization: Fused Add + RMSNorm
+# ============================================================================
 
+@triton.jit
+def fused_add_rmsnorm_kernel(
+    x_ptr, residual_ptr, weight_ptr, y_ptr,
+    stride_x_row, stride_res_row, stride_y_row,
+    n_cols, eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Fused Add + RMSNorm Kernel
+    1. x_new = x + residual
+    2. Write x_new back to residual (in-place update)
+    3. y = RMSNorm(x_new)
+    """
+    row_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+
+    # Calculate physical pointers for the current row
+    x_ptrs = x_ptr + row_idx * stride_x_row + offsets
+    res_ptrs = residual_ptr + row_idx * stride_res_row + offsets
+
+    # Step 1: Load both x and residual into SRAM
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    res = tl.load(res_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Step 2: Fused addition in registers
+    x_new = x + res
+
+    # Step 3: In-place update! Write the new residual back to HBM immediately
+    tl.store(res_ptrs, x_new, mask=mask)
+
+    # Step 4: Compute RMSNorm on x_new in registers
+    x_new_sq = x_new * x_new
+    variance = tl.sum(x_new_sq, axis=0) / n_cols
+    rsqrt = tl.math.rsqrt(variance + eps)
+
+    # Load weight and calculate final normalized output
+    weight_ptrs = weight_ptr + offsets
+    weight = tl.load(weight_ptrs, mask=mask, other=0.0).to(tl.float32)
+    y = x_new * rsqrt * weight
+
+    # Step 5: Store the final normalized output
+    y_ptrs = y_ptr + row_idx * stride_y_row + offsets
+    tl.store(y_ptrs, y, mask=mask)
+
+
+def fused_add_rmsnorm(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """
+    PyTorch wrapper for the Fused Add + RMSNorm kernel.
+    Note: 'residual' is updated IN-PLACE.
+    """
+    # Flatten the batch and seq_len dimensions to treat it as a 2D matrix (rows, cols)
+    x_2d = x.view(-1, x.shape[-1])
+    res_2d = residual.view(-1, residual.shape[-1])
+
+    n_rows, n_cols = x_2d.shape
+    y_2d = torch.empty_like(x_2d)
+
+    # Power of 2 padding for Triton
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+
+    # 1D Grid: one block per row (Token)
+    grid = (n_rows,)
+
+    fused_add_rmsnorm_kernel[grid](
+        x_2d, res_2d, weight, y_2d,
+        x_2d.stride(0), res_2d.stride(0), y_2d.stride(0),
+        n_cols, eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    # Reshape back to original dimensions
+    return y_2d.view_as(x)
 
 # ============================================================================
 # Layer Classes
@@ -564,19 +626,32 @@ class RMSNorm:
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
+        # 注意：这里可能需要引入 _is_power_of_two, 如果它在文件其他地方定义了
         self.use_triton = _is_power_of_two(hidden_size)
 
-    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+    def __call__(self, x: torch.Tensor, residual: torch.Tensor = None) -> torch.Tensor:
         original_shape = x.shape
 
+        # 提前进行设备同步，确保 weight 和 x 在同一个 GPU/CPU 上
+        if self.weight.device != x.device:
+            self.weight = self.weight.to(x.device)
+
         if self.use_triton and x.is_cuda:
+            # ==========================================
+            # 🚀 进阶融合分支 (原创设计：Fused Add + RMSNorm)
+            # ==========================================
+            if residual is not None:
+                # 调用我们在文件底部写好的 Triton 融合算子
+                # 注意：传入的 residual 张量将会被原地 (in-place) 更新！
+                return fused_add_rmsnorm(x, residual, self.weight, self.eps)
+
+            # ==========================================
+            # 🐌 标准朴素分支 (完全保留原汁原味的老师代码)
+            # ==========================================
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
             x_flat = x_flat.to(torch.float32)
             output = torch.empty_like(x_flat)
-
-            if self.weight.device != x.device:
-                self.weight = self.weight.to(x.device)
 
             block = next_power_of_two(self.hidden_size)
             rmsnorm_kernel[(batch_size,)](
@@ -591,11 +666,18 @@ class RMSNorm:
             )
             return output.reshape(original_shape)
 
-        x_float = x.to(torch.float32)
+        # ==========================================
+        # 🛠️ PyTorch Fallback 后备分支 (CPU 或维度非 2 的幂)
+        # ==========================================
+        if residual is not None:
+            # 在纯 PyTorch 模式下，我们也必须手动模拟“原地相加”的逻辑
+            residual.add_(x) 
+            x_float = residual.to(torch.float32)
+        else:
+            x_float = x.to(torch.float32)
+            
         variance = torch.mean(x_float * x_float, dim=-1, keepdim=True)
         x_normed = x_float * torch.rsqrt(variance + self.eps)
-        if self.weight.device != x.device:
-            self.weight = self.weight.to(x.device)
         return (self.weight * x_normed).to(x.dtype)
 
 
@@ -697,7 +779,7 @@ class Linear:
     TILE_N = 64
     TILE_K = 32
 
-    BACKEND = "triton"
+    BACKEND = "triton"  
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
@@ -796,10 +878,13 @@ class Linear:
             triton.cdiv(M_padded, self.TILE_M),
             triton.cdiv(self._N_padded, self.TILE_N),
         )
+        has_bias = self.has_bias and self.bias_param is not None
+        bias_ptr = self.bias_param.to(x.device) if has_bias else output.new_empty(0)
         linear_kernel_tf32[grid](
             x_padded,
             self._weight_t_padded,
             output,
+            bias_ptr,
             M_padded,
             self._N_padded,
             self._K_padded,
@@ -809,17 +894,13 @@ class Linear:
             self._weight_t_padded.stride(1),
             output.stride(0),
             output.stride(1),
+            HAS_BIAS=has_bias,
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
         )
 
         output = output[:M, :N]
-
-        if self.has_bias and self.bias_param is not None:
-            if self.bias_param.device != x.device:
-                self.bias_param = self.bias_param.to(x.device)
-            output = output + self.bias_param
 
         return output.reshape(*batch_dims, self.out_features)
 
