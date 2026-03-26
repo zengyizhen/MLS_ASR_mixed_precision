@@ -900,7 +900,7 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
 class MLP:
     """MLP with SwiGLU gating using Triton."""
 
-    FUSED = True
+    FUSED = False
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
