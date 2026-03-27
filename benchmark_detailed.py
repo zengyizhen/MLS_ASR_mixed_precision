@@ -106,6 +106,7 @@ def patch_module_for_profiling(module, prefix=""):
                 def profiled_forward(*args, **kwargs):
                     with profile_region(prof_name):
                         return orig_fwd(*args, **kwargs)
+
                 return profiled_forward
 
             child.forward = make_profiled_forward(original_forward, full_name)
@@ -161,7 +162,7 @@ def profile_operators_cupy(model, input_features, input_ids, input_features_mask
             )
 
         cp.cuda.Device().synchronize()
-        print(f"  Run {run+1}/{num_runs} complete")
+        print(f"  Run {run + 1}/{num_runs} complete")
 
     PROFILE_ENABLED = False
     return output
@@ -174,9 +175,33 @@ def detailed_profile(model, input_features, input_ids, input_features_mask, num_
     results = {}
     timer = CUDATimer()
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("DETAILED OPERATOR PROFILING")
-    print("="*70)
+    print("=" * 70)
+
+    # =====================================================================
+    # ADDED WARMUP: Clean up JIT compilation and initial loading taxes
+    # =====================================================================
+    print("\n[0/4] Warming up GPU and JIT compiler...")
+    cp.cuda.Device().synchronize()
+    with cp.cuda.Device():
+        _audio = model.audio_encoder(input_features)
+        _proj = model.multi_modal_projector(_audio)
+        _embeds = model.text_decoder.embed_tokens(input_ids)
+        _mask = (input_ids == 59260)
+        _combined = _embeds.copy()
+        if cp.any(_mask):
+            _pos = cp.where(_mask[0])[0]
+            _num = len(_pos)
+            if _num <= _proj.shape[1]:
+                _combined[0, _pos[:_proj.shape[1]]] = _proj[0, :_num]
+        _hidden = model.text_decoder(inputs_embeds=_combined)
+        _logits = model.lm_head(_hidden[:, -1:, :])
+        _next_tok = cp.argmax(_logits[:, -1, :], axis=-1, keepdims=True)
+        _next_emb = model.text_decoder.embed_tokens(_next_tok)
+        _ = model.text_decoder(inputs_embeds=_next_emb)
+    cp.cuda.Device().synchronize()
+    # =====================================================================
 
     # 1. Profile Audio Encoder
     print("\n[1/4] Profiling Audio Encoder...")
@@ -246,7 +271,8 @@ def detailed_profile(model, input_features, input_ids, input_features_mask, num_
         'min': np.min(prefill_times),
         'max': np.max(prefill_times)
     }
-    print(f"  Decoder Prefill: {results['decoder_prefill']['mean']:.2f}ms (+/- {results['decoder_prefill']['std']:.2f}ms)")
+    print(
+        f"  Decoder Prefill: {results['decoder_prefill']['mean']:.2f}ms (+/- {results['decoder_prefill']['std']:.2f}ms)")
 
     # 4. Profile Decode Steps (autoregressive)
     print("\n[4/4] Profiling Decode Steps...")
@@ -328,9 +354,34 @@ def detailed_profile_torch(model, input_features, input_ids, input_features_mask
     results = {}
     timer = TorchTimer()
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("DETAILED OPERATOR PROFILING (TORCH)")
-    print("="*70)
+    print("=" * 70)
+
+    # =====================================================================
+    # ADDED WARMUP: Clean up JIT compilation and initial loading taxes
+    # =====================================================================
+    print("\n[0/4] Warming up GPU and JIT compiler...")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _audio = model.audio_encoder(input_features)
+    _proj = model.multi_modal_projector(_audio)
+    _embeds = model.text_decoder.embed_tokens(input_ids)
+    _mask = (input_ids == 59260)
+    _combined = _embeds.clone()
+    if torch.any(_mask):
+        _pos = torch.where(_mask[0])[0]
+        _num = int(_pos.numel())
+        if _num <= _proj.shape[1]:
+            _combined[0, _pos[:_proj.shape[1]]] = _proj[0, :_num]
+    _hidden = model.text_decoder(inputs_embeds=_combined)
+    _logits = model.lm_head(_hidden[:, -1:, :])
+    _next_tok = torch.argmax(_logits[:, -1, :], dim=-1, keepdim=True)
+    _next_emb = model.text_decoder.embed_tokens(_next_tok)
+    _ = model.text_decoder(inputs_embeds=_next_emb)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    # =====================================================================
 
     print("\n[1/4] Profiling Audio Encoder...")
     encoder_times = []
@@ -394,7 +445,8 @@ def detailed_profile_torch(model, input_features, input_ids, input_features_mask
         'min': np.min(prefill_times),
         'max': np.max(prefill_times)
     }
-    print(f"  Decoder Prefill: {results['decoder_prefill']['mean']:.2f}ms (+/- {results['decoder_prefill']['std']:.2f}ms)")
+    print(
+        f"  Decoder Prefill: {results['decoder_prefill']['mean']:.2f}ms (+/- {results['decoder_prefill']['std']:.2f}ms)")
 
     print("\n[4/4] Profiling Decode Steps...")
     decode_times = []
@@ -467,9 +519,9 @@ def profile_attention_ops(model, seq_len=256, num_runs=5):
     """Profile attention operations specifically."""
     import cupy as cp
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("ATTENTION OPERATION PROFILING")
-    print("="*70)
+    print("=" * 70)
 
     timer = CUDATimer()
     results = {}
@@ -487,6 +539,11 @@ def profile_attention_ops(model, seq_len=256, num_runs=5):
 
     # 1. Standard attention (QK^T, softmax, V)
     print(f"\nSequence length: {seq_len}")
+
+    # Warmup
+    cp.cuda.Device().synchronize()
+    _ = cp.einsum('bhqd,bhkd->bhqk', q, k)
+    cp.cuda.Device().synchronize()
 
     print("\n[1] Standard Attention (einsum)...")
     standard_times = []
@@ -514,6 +571,11 @@ def profile_attention_ops(model, seq_len=256, num_runs=5):
     k_2d = k.reshape(batch_size * num_heads, seq_len, head_dim)
     v_2d = v.reshape(batch_size * num_heads, seq_len, head_dim)
 
+    # Warmup
+    cp.cuda.Device().synchronize()
+    _ = cp.matmul(q_2d, k_2d.transpose(0, 2, 1))
+    cp.cuda.Device().synchronize()
+
     for _ in range(num_runs):
         cp.cuda.Device().synchronize()
         timer.start()
@@ -536,9 +598,9 @@ def profile_attention_ops_torch(seq_len=256, num_runs=5):
     """Profile attention operations specifically (Torch)."""
     import torch
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("ATTENTION OPERATION PROFILING (TORCH)")
-    print("="*70)
+    print("=" * 70)
 
     timer = TorchTimer()
     results = {}
@@ -555,6 +617,11 @@ def profile_attention_ops_torch(seq_len=256, num_runs=5):
 
     print(f"\nSequence length: {seq_len}")
 
+    # Warmup
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _ = torch.einsum('bhqd,bhkd->bhqk', q, k)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+
     print("\n[1] Standard Attention (einsum)...")
     standard_times = []
     for _ in range(num_runs):
@@ -562,7 +629,8 @@ def profile_attention_ops_torch(seq_len=256, num_runs=5):
             torch.cuda.synchronize()
         timer.start()
 
-        scores = torch.einsum('bhqd,bhkd->bhqk', q, k) / torch.sqrt(torch.tensor(head_dim, dtype=torch.float32, device=device))
+        scores = torch.einsum('bhqd,bhkd->bhqk', q, k) / torch.sqrt(
+            torch.tensor(head_dim, dtype=torch.float32, device=device))
         attn_weights = torch.exp(scores - torch.max(scores, dim=-1, keepdim=True).values)
         attn_weights = attn_weights / torch.sum(attn_weights, dim=-1, keepdim=True)
         output = torch.einsum('bhqk,bhkd->bhqd', attn_weights, v)
@@ -580,12 +648,18 @@ def profile_attention_ops_torch(seq_len=256, num_runs=5):
     k_2d = k.reshape(batch_size * num_heads, seq_len, head_dim)
     v_2d = v.reshape(batch_size * num_heads, seq_len, head_dim)
 
+    # Warmup
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _ = torch.matmul(q_2d, k_2d.transpose(1, 2))
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+
     for _ in range(num_runs):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         timer.start()
 
-        scores = torch.matmul(q_2d, k_2d.transpose(1, 2)) / torch.sqrt(torch.tensor(head_dim, dtype=torch.float32, device=device))
+        scores = torch.matmul(q_2d, k_2d.transpose(1, 2)) / torch.sqrt(
+            torch.tensor(head_dim, dtype=torch.float32, device=device))
         attn_weights = torch.exp(scores - torch.max(scores, dim=-1, keepdim=True).values)
         attn_weights = attn_weights / torch.sum(attn_weights, dim=-1, keepdim=True)
         output = torch.matmul(attn_weights, v_2d)
@@ -603,9 +677,9 @@ def profile_linear_ops(hidden_size=2048, intermediate_size=5632, batch_size=1, s
     """Profile linear/GEMM operations."""
     import cupy as cp
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("LINEAR/GEMM OPERATION PROFILING")
-    print("="*70)
+    print("=" * 70)
 
     timer = CUDATimer()
     results = {}
@@ -617,6 +691,11 @@ def profile_linear_ops(hidden_size=2048, intermediate_size=5632, batch_size=1, s
 
     print(f"\nInput shape: ({batch_size}, {seq_len}, {hidden_size})")
     print(f"Projection: {hidden_size} -> {intermediate_size}")
+
+    # Warmup
+    cp.cuda.Device().synchronize()
+    _ = cp.matmul(x, w_proj)
+    cp.cuda.Device().synchronize()
 
     # 1. CuPy matmul
     print("\n[1] CuPy matmul...")
@@ -630,6 +709,11 @@ def profile_linear_ops(hidden_size=2048, intermediate_size=5632, batch_size=1, s
 
     results['cupy_matmul'] = np.mean(matmul_times)
     print(f"  CuPy matmul: {np.mean(matmul_times):.2f}ms (+/- {np.std(matmul_times):.2f}ms)")
+
+    # Warmup
+    cp.cuda.Device().synchronize()
+    _ = cp.einsum('bsh,ho->bso', x, w_proj)
+    cp.cuda.Device().synchronize()
 
     # 2. CuPy einsum
     print("\n[2] CuPy einsum...")
@@ -647,6 +731,12 @@ def profile_linear_ops(hidden_size=2048, intermediate_size=5632, batch_size=1, s
     # 3. cuBLAS GEMM (via reshape + matmul)
     print("\n[3] cuBLAS GEMM (batched)...")
     x_2d = x.reshape(-1, hidden_size)
+
+    # Warmup
+    cp.cuda.Device().synchronize()
+    _ = cp.matmul(x_2d, w_proj)
+    cp.cuda.Device().synchronize()
+
     gemm_times = []
     for _ in range(num_runs):
         cp.cuda.Device().synchronize()
@@ -662,6 +752,11 @@ def profile_linear_ops(hidden_size=2048, intermediate_size=5632, batch_size=1, s
     print("\n[4] Full MLP (SwiGLU style)...")
     w_gate = cp.random.randn(hidden_size, intermediate_size, dtype=cp.float32)
     w_up = cp.random.randn(hidden_size, intermediate_size, dtype=cp.float32)
+
+    # Warmup
+    cp.cuda.Device().synchronize()
+    _gate = cp.matmul(x, w_gate)
+    cp.cuda.Device().synchronize()
 
     mlp_times = []
     for _ in range(num_runs):
@@ -693,9 +788,9 @@ def profile_linear_ops_torch(hidden_size=2048, intermediate_size=5632, batch_siz
     """Profile linear/GEMM operations (Torch)."""
     import torch
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("LINEAR/GEMM OPERATION PROFILING (TORCH)")
-    print("="*70)
+    print("=" * 70)
 
     timer = TorchTimer()
     results = {}
@@ -709,6 +804,11 @@ def profile_linear_ops_torch(hidden_size=2048, intermediate_size=5632, batch_siz
     print(f"\nInput shape: ({batch_size}, {seq_len}, {hidden_size})")
     print(f"Projection: {hidden_size} -> {intermediate_size}")
 
+    # Warmup
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _ = torch.matmul(x, w_proj)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+
     print("\n[1] Torch matmul...")
     matmul_times = []
     for _ in range(num_runs):
@@ -721,6 +821,11 @@ def profile_linear_ops_torch(hidden_size=2048, intermediate_size=5632, batch_siz
 
     results['torch_matmul'] = np.mean(matmul_times)
     print(f"  Torch matmul: {np.mean(matmul_times):.2f}ms (+/- {np.std(matmul_times):.2f}ms)")
+
+    # Warmup
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _ = torch.einsum('bsh,ho->bso', x, w_proj)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     print("\n[2] Torch einsum...")
     einsum_times = []
@@ -737,6 +842,12 @@ def profile_linear_ops_torch(hidden_size=2048, intermediate_size=5632, batch_siz
 
     print("\n[3] Torch GEMM (batched)...")
     x_2d = x.reshape(-1, hidden_size)
+
+    # Warmup
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _ = torch.matmul(x_2d, w_proj)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+
     gemm_times = []
     for _ in range(num_runs):
         if torch.cuda.is_available():
@@ -752,6 +863,11 @@ def profile_linear_ops_torch(hidden_size=2048, intermediate_size=5632, batch_siz
     print("\n[4] Full MLP (SwiGLU style)...")
     w_gate = torch.randn(hidden_size, intermediate_size, device=device)
     w_up = torch.randn(hidden_size, intermediate_size, device=device)
+
+    # Warmup
+    if torch.cuda.is_available(): torch.cuda.synchronize()
+    _gate = torch.matmul(x, w_gate)
+    if torch.cuda.is_available(): torch.cuda.synchronize()
 
     mlp_times = []
     for _ in range(num_runs):
@@ -780,12 +896,12 @@ def profile_linear_ops_torch(hidden_size=2048, intermediate_size=5632, batch_siz
 
 def print_summary(component_results, attention_results, linear_results):
     """Print a summary table of all profiling results."""
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("PERFORMANCE SUMMARY")
-    print("="*70)
+    print("=" * 70)
 
     print("\n{:<35} {:>12} {:>12}".format("Component", "Time (ms)", "% of Total"))
-    print("-"*60)
+    print("-" * 60)
 
     # Calculate total time
     total = 0
@@ -813,14 +929,14 @@ def print_summary(component_results, attention_results, linear_results):
             pct = (t / total * 100) if total > 0 else 0
             print(f"{'Decoder (50 decode steps)':<35} {t:>10.2f}ms {pct:>10.1f}%")
 
-    print("-"*60)
+    print("-" * 60)
     print(f"{'TOTAL (estimated for 50 tokens)':<35} {total:>10.2f}ms")
 
     # Attention comparison
     if attention_results:
-        print("\n" + "-"*60)
+        print("\n" + "-" * 60)
         print("Attention Methods Comparison:")
-        print("-"*60)
+        print("-" * 60)
         if 'standard_attention' in attention_results:
             print(f"  {'Standard (einsum)':<25} {attention_results['standard_attention']:>10.2f}ms")
         if 'cublas_attention' in attention_results:
@@ -830,9 +946,9 @@ def print_summary(component_results, attention_results, linear_results):
 
     # Linear comparison
     if linear_results:
-        print("\n" + "-"*60)
+        print("\n" + "-" * 60)
         print("Linear/GEMM Methods Comparison:")
-        print("-"*60)
+        print("-" * 60)
         if 'cupy_matmul' in linear_results:
             print(f"  {'CuPy matmul':<25} {linear_results['cupy_matmul']:>10.2f}ms")
         if 'cupy_einsum' in linear_results:
@@ -877,7 +993,7 @@ def run_nsys_profile(folder, audio_path=None):
 def main():
     parser = argparse.ArgumentParser(description='Detailed operator profiling')
     parser.add_argument('folder', type=str, nargs='?', default='glm_asr_cutile_example',
-                       help='Folder name to benchmark')
+                        help='Folder name to benchmark')
     parser.add_argument('--audio', type=str, help='Path to test audio file')
     parser.add_argument('--runs', type=int, default=3, help='Number of profiling runs')
     parser.add_argument('--nsys', action='store_true', help='Run Nsight Systems profiling')
@@ -886,9 +1002,9 @@ def main():
     parser.add_argument('--seq-len', type=int, default=256, help='Sequence length for micro-benchmarks')
     args = parser.parse_args()
 
-    print("="*70)
+    print("=" * 70)
     print("GLM-ASR Detailed Operator Profiling")
-    print("="*70)
+    print("=" * 70)
 
     # Run nsys if requested
     if args.nsys:
@@ -939,7 +1055,7 @@ def main():
         if n_channels > 1:
             audio_array = audio_array.reshape(-1, n_channels).mean(axis=1)
 
-    print(f"Audio: {len(audio_array)/sr:.2f}s @ {sr}Hz")
+    print(f"Audio: {len(audio_array) / sr:.2f}s @ {sr}Hz")
 
     # Load model
     folder_path = os.path.join(script_dir, args.folder)
@@ -967,14 +1083,17 @@ def main():
         else:
             features = processor(audio_array, sampling_rate=16000, return_tensors="pt", padding="max_length")
             input_features = features['input_features'].to(device=device, dtype=torch.float32)
-            input_ids = torch.tensor([[59253, 10, 59261] + [59260] * 100 + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254, 10]],
-                                     dtype=torch.int64, device=device)
+            input_ids = torch.tensor(
+                [[59253, 10, 59261] + [59260] * 100 + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254,
+                                                       10]],
+                dtype=torch.int64, device=device)
             input_features_mask = None
 
         print(f"Input features shape: {input_features.shape}")
         print(f"Input IDs shape: {input_ids.shape}")
 
-        component_results = detailed_profile_torch(model, input_features, input_ids, input_features_mask, num_runs=args.runs)
+        component_results = detailed_profile_torch(model, input_features, input_ids, input_features_mask,
+                                                   num_runs=args.runs)
         attention_results = profile_attention_ops_torch(seq_len=args.seq_len, num_runs=args.runs)
         linear_results = profile_linear_ops_torch(seq_len=args.seq_len, num_runs=args.runs)
     else:
@@ -989,7 +1108,9 @@ def main():
         else:
             features = processor(audio_array, sampling_rate=16000, return_tensors="pt", padding="max_length")
             input_features = cp.asarray(features['input_features'].numpy(), dtype=cp.float32)
-            input_ids = cp.array([[59253, 10, 59261] + [59260] * 100 + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254, 10]], dtype=cp.int64)
+            input_ids = cp.array(
+                [[59253, 10, 59261] + [59260] * 100 + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254,
+                                                       10]], dtype=cp.int64)
             input_features_mask = None
 
         print(f"Input features shape: {input_features.shape}")
