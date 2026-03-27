@@ -194,6 +194,8 @@ def linear_kernel_tf32(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    num_warps=self.NUM_WARPS,   
+    num_stages=self.NUM_STAGES, 
 ):
     """
     TF32-style matmul: output = A @ B.
@@ -696,6 +698,8 @@ class Linear:
     TILE_M = 64
     TILE_N = 64
     TILE_K = 32
+    NUM_WARPS = 4   
+    NUM_STAGES = 1  
 
     BACKEND = "triton"
 
