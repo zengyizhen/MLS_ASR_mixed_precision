@@ -242,8 +242,8 @@ def linear_gelu_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    num_warps=self.NUM_WARPS,   
-    num_stages=self.NUM_STAGES,
+    num_warps=4,   
+    num_stages=3,
 ):
     """Fused Linear + GELU."""
     pid_m = tl.program_id(0)
