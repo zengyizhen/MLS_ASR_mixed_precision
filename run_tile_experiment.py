@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tile Size Experiment v2 for linear_kernel_tf32
+Tile Size Experiment for linear_kernel_tf32
 Fixed: num_warps=4, num_stages=1
 Variable: TILE_M, TILE_N, TILE_K
 Conditions: Linear.BACKEND="triton", MLP.FUSED=False, EncoderMLP.FUSED=False
@@ -15,12 +15,19 @@ LAYERS_PATH = os.path.join(FOLDER, "layers.py")
 
 # 实验配置：(TILE_M, TILE_N, TILE_K, 描述)
 CONFIGS = [
+    # 极小分块组 (探底 Decode 性能边界)
+    (16,  32,  32, "极小分块(高频调度)"),
+    (16,  64,  32, "极小M(TensorCore下界)"),
+    (32,  32,  32, "同时缩小M和N"),
+    (32,  64,  32, "缩小M(适应Decode)"),
+    
+    # 现有基准与大分块组
     (64,  64,  32, "baseline"),
+    (64,  256, 64, "增大N和K"),
     (128, 64,  32, "增大TILE_M"),
-    (64,  256, 64, "Decoder最优(前一轮)"),
-    (128, 256, 64, "同时增大M和N/K"),
-    (128, 128, 64, "平衡配置"),
     (128, 128, 32, "增大M和N"),
+    (128, 128, 64, "平衡配置(Encoder最优)"),
+    (128, 256, 64, "同时增大M和N/K"),
 ]
 
 
