@@ -13,24 +13,22 @@ import numpy as np
 import sys
 import os
 
-# 添加模板路径以导入 linear_kernel_tf32
 FOLDER = "glm_asr_triton_template"
 sys.path.insert(0, FOLDER)
 
 from layers import linear_kernel_tf32, pad_to_multiple
 
 # Encoder FC1 实际矩阵尺寸
-M = 750   # 音频序列长度（3000经过stride=2的卷积两次后约750）
-K = 1280  # audio_hidden_size
-N = 5120  # audio_intermediate_size
+M = 750
+K = 1280
+N = 5120
 
-NUM_RUNS = 20  # 每个配置跑多少次取平均
+NUM_RUNS = 20
 
 
 def run_single_config(tile_m, tile_n, tile_k, num_warps, num_stages, device):
     """运行单个配置并返回平均时间（ms）和 TFLOPS"""
 
-    # 准备输入数据
     M_pad = pad_to_multiple(M, tile_m)
     K_pad = pad_to_multiple(K, tile_k)
     N_pad = pad_to_multiple(N, tile_n)
@@ -39,9 +37,11 @@ def run_single_config(tile_m, tile_n, tile_k, num_warps, num_stages, device):
     b = torch.zeros((K_pad, N_pad), dtype=torch.float32, device=device)
     c = torch.zeros((M_pad, N_pad), dtype=torch.float32, device=device)
 
-    # 填入真实数据部分
     a[:M, :K] = torch.randn(M, K, device=device)
     b[:K, :N] = torch.randn(K, N, device=device)
+
+    # bias_ptr 占位（HAS_BIAS=False 时 kernel 不会访问）
+    bias_ptr = c.new_empty(0)
 
     grid = (triton.cdiv(M_pad, tile_m), triton.cdiv(N_pad, tile_n))
 
@@ -49,10 +49,12 @@ def run_single_config(tile_m, tile_n, tile_k, num_warps, num_stages, device):
     for _ in range(5):
         linear_kernel_tf32[grid](
             a, b, c,
+            bias_ptr,
             M_pad, N_pad, K_pad,
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),
+            HAS_BIAS=False,
             BLOCK_M=tile_m,
             BLOCK_N=tile_n,
             BLOCK_K=tile_k,
@@ -70,10 +72,12 @@ def run_single_config(tile_m, tile_n, tile_k, num_warps, num_stages, device):
         start.record()
         linear_kernel_tf32[grid](
             a, b, c,
+            bias_ptr,
             M_pad, N_pad, K_pad,
             a.stride(0), a.stride(1),
             b.stride(0), b.stride(1),
             c.stride(0), c.stride(1),
+            HAS_BIAS=False,
             BLOCK_M=tile_m,
             BLOCK_N=tile_n,
             BLOCK_K=tile_k,
@@ -85,7 +89,6 @@ def run_single_config(tile_m, tile_n, tile_k, num_warps, num_stages, device):
         times.append(start.elapsed_time(end))
 
     avg_time_ms = np.mean(times)
-    # TFLOPS = 2 * M * N * K / time_s / 1e12
     tflops = 2 * M * N * K / (avg_time_ms / 1000) / 1e12
 
     return avg_time_ms, tflops
@@ -104,7 +107,7 @@ def main():
     print("-" * 75)
 
     # ============================================================
-    # 第一轮配置：固定 warps=4, stages=1，变 tile size
+    # 第一轮：固定 warps=4, stages=1，变 tile size
     # ============================================================
     round1_configs = [
         (64,  64,  32, 4, 1, "baseline"),
@@ -116,18 +119,20 @@ def main():
     ]
 
     print("--- Round 1: Fixed warps=4, stages=1, Variable tile size ---")
-    round1_results = []
+    all_results = []
     for tile_m, tile_n, tile_k, warps, stages, desc in round1_configs:
         label = f"[{tile_m}x{tile_n}x{tile_k}]"
         try:
-            avg_time, tflops = run_single_config(tile_m, tile_n, tile_k, warps, stages, device)
-            round1_results.append((label, warps, stages, avg_time, tflops, desc))
+            avg_time, tflops = run_single_config(
+                tile_m, tile_n, tile_k, warps, stages, device
+            )
+            all_results.append((label, warps, stages, avg_time, tflops, desc))
             print(f"{label:<20} | {warps:>5} | {stages:>6} | {avg_time:>10.3f} | {tflops:>8.2f}  # {desc}")
         except Exception as e:
             print(f"{label:<20} | {warps:>5} | {stages:>6} | {'ERROR':>10} | {'N/A':>8}  # {e}")
 
     # ============================================================
-    # 第二轮配置：固定 TILE_M=128, TILE_N=64, TILE_K=32，变 warps/stages
+    # 第二轮：固定 TILE_M=128, TILE_N=64, TILE_K=32，变 warps/stages
     # ============================================================
     round2_configs = [
         (128, 64, 32, 4, 1, "baseline"),
@@ -140,12 +145,13 @@ def main():
     ]
 
     print("\n--- Round 2: Fixed TILE_M=128, TILE_N=64, TILE_K=32, Variable warps/stages ---")
-    round2_results = []
     for tile_m, tile_n, tile_k, warps, stages, desc in round2_configs:
         label = f"[{tile_m}x{tile_n}x{tile_k}]"
         try:
-            avg_time, tflops = run_single_config(tile_m, tile_n, tile_k, warps, stages, device)
-            round2_results.append((label, warps, stages, avg_time, tflops, desc))
+            avg_time, tflops = run_single_config(
+                tile_m, tile_n, tile_k, warps, stages, device
+            )
+            all_results.append((label, warps, stages, avg_time, tflops, desc))
             print(f"{label:<20} | {warps:>5} | {stages:>6} | {avg_time:>10.3f} | {tflops:>8.2f}  # {desc}")
         except Exception as e:
             print(f"{label:<20} | {warps:>5} | {stages:>6} | {'ERROR':>10} | {'N/A':>8}  # {e}")
@@ -157,18 +163,23 @@ def main():
     print("Summary:")
     print("-" * 75)
 
-    all_results = round1_results + round2_results
-    valid = [(l, w, s, t, f, d) for l, w, s, t, f, d in all_results if isinstance(t, float)]
+    valid = [
+        (l, w, s, t, f, d) for l, w, s, t, f, d in all_results
+        if isinstance(t, float)
+    ]
 
     if valid:
-        best = max(valid, key=lambda x: x[4])
+        best  = max(valid, key=lambda x: x[4])
         worst = min(valid, key=lambda x: x[4])
-        print(f"Best  : {best[0]} warps={best[1]},stages={best[2]} → {best[3]:.3f}ms, {best[4]:.2f} TFLOPS  ({best[5]})")
-        print(f"Worst : {worst[0]} warps={worst[1]},stages={worst[2]} → {worst[3]:.3f}ms, {worst[4]:.2f} TFLOPS  ({worst[5]})")
+        print(f"Best  : {best[0]} warps={best[1]},stages={best[2]}"
+              f" → {best[3]:.3f}ms, {best[4]:.2f} TFLOPS  ({best[5]})")
+        print(f"Worst : {worst[0]} warps={worst[1]},stages={worst[2]}"
+              f" → {worst[3]:.3f}ms, {worst[4]:.2f} TFLOPS  ({worst[5]})")
         print(f"Speedup best vs worst: {worst[3]/best[3]:.2f}x")
-
-    print(f"\nReference: A100 peak FP32 = 19.5 TFLOPS")
-    print(f"GPU utilization of best config: {best[4]/19.5*100:.1f}%")
+        print(f"\nReference: A100 peak FP32 = 19.5 TFLOPS")
+        print(f"GPU utilization of best config: {best[4]/19.5*100:.1f}%")
+    else:
+        print("No valid results.")
 
 
 if __name__ == "__main__":
