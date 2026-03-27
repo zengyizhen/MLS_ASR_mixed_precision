@@ -1031,7 +1031,7 @@ class MLP:
 class EncoderMLP:
     """Encoder MLP (no gating) using Triton."""
 
-    FUSED = False
+    FUSED = True
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
