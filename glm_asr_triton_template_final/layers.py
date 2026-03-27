@@ -242,6 +242,8 @@ def linear_gelu_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    num_warps=self.NUM_WARPS,   
+    num_stages=self.NUM_STAGES,
 ):
     """Fused Linear + GELU."""
     pid_m = tl.program_id(0)
@@ -775,9 +777,11 @@ def get_activation(name: str):
 class Linear:
     """Linear layer with switchable backend (torch or Triton)."""
 
-    TILE_M = 64
+    TILE_M = 128
     TILE_N = 64
     TILE_K = 32
+    NUM_WARPS = 4   
+    NUM_STAGES = 3  
 
     BACKEND = "triton"  
 
