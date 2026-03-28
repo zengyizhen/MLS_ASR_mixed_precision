@@ -626,8 +626,7 @@ class RMSNorm:
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight = torch.ones(hidden_size, dtype=torch.float32)
-        # 注意：这里可能需要引入 _is_power_of_two, 如果它在文件其他地方定义了
-        self.use_triton = _is_power_of_two(hidden_size)
+        # self.use_triton = _is_power_of_two(hidden_size)
 
     def __call__(self, x: torch.Tensor, residual: torch.Tensor = None) -> torch.Tensor:
         original_shape = x.shape
