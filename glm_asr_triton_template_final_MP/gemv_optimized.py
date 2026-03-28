@@ -545,6 +545,129 @@ def run_benchmark():
 
 
 # ============================================================================
+# 一键替换：apply_gemv_optimization(model)
+# ============================================================================
+#
+# 调用时机：weight_loader 加载完权重之后，generate() 之前。只调用一次。
+#
+# 覆盖范围：
+#   ✅ text_decoder.layers[*].q/k/v/o_proj  — M=1 GEMV 瓶颈，收益最大
+#   ✅ text_decoder.layers[*].mlp.*_proj    — 同上（绕过 MLP fused path，
+#                                              decode 时走 standard 路径）
+#   ✅ lm_head                              — M=1 GEMV (3584→151552)
+#   ⬜ audio_encoder                        — M=375 prefill，用 torch GEMM 已足够
+#   ⬜ multi_modal_projector                — M~93，不是瓶颈
+
+def _replace_linear(obj, attr_name: str, mode: str):
+    """将 obj.attr_name (Linear) 替换为 OptimizedLinear。"""
+    from layers import Linear as OrigLinear
+    lin = getattr(obj, attr_name, None)
+    if lin is None or not isinstance(lin, OrigLinear):
+        return
+    opt = OptimizedLinear.from_linear(lin, mode=mode)
+    setattr(obj, attr_name, opt)
+
+
+def _patch_mlp_for_gemv(mlp):
+    """
+    MLP 的 fused SwiGLU kernel 在 M=1 时同样有 TILE_M=64 的 padding 浪费。
+    此补丁让 M<=GEMV_THRESHOLD 时走 standard 路径，
+    由此路径中的 OptimizedLinear 负责 GEMV。
+    """
+    original_call = mlp.__call__.__func__  # 取 unbound method
+
+    def patched_call(self_mlp, x):
+        M = int(x.shape[0] * x.shape[1]) if x.ndim == 3 else int(x.shape[0])
+        if M <= GEMV_THRESHOLD and x.is_cuda:
+            return self_mlp._forward_standard(x)   # 走 GEMV 路径
+        return original_call(self_mlp, x)           # 走原来的 fused 路径
+
+    import types
+    mlp.__call__ = types.MethodType(patched_call, mlp)
+
+
+def apply_gemv_optimization(model, mode: str = "fp16"):
+    """
+    将 Text Decoder 中所有 Linear 层替换为 OptimizedLinear。
+
+    参数：
+      model — GlmAsrModel 实例（已加载权重）
+      mode  — "fp32" | "fp16" | "int8"
+               fp16 推荐：精度无损，带宽减半
+               int8 激进：量化误差 ~0.01%，带宽减至 1/4
+
+    用法（仅需两行）：
+      from gemv_optimized import apply_gemv_optimization
+      apply_gemv_optimization(model, mode="fp16")   # 在 generate() 之前调用
+
+    收益估算（decode 阶段，M=1）：
+      mode="fp16"  → 预期加速 2-4×（消除 128× padding + 带宽减半）
+      mode="int8"  → 预期加速 3-6×（INT8 带宽仅 FP32 的 1/4）
+    """
+    print(f"\n[apply_gemv_optimization] mode={mode}")
+    print("正在替换 Text Decoder 的 Linear 层...")
+
+    decoder = model.text_decoder
+    replaced = 0
+
+    # ── 1. 替换每个 DecoderLayer 的注意力投影 ─────────────────────────────
+    for i, layer in enumerate(decoder.layers):
+        for attr in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            _replace_linear(layer, attr, mode)
+            replaced += 1
+
+        # ── 2. 替换 MLP 内部的 Linear 并 patch 路由逻辑 ──────────────────
+        mlp = layer.mlp
+        for attr in ("gate_proj", "up_proj", "down_proj"):
+            _replace_linear(mlp, attr, mode)
+            replaced += 1
+        # 清除 MLP 预缓存的转置权重（已无效）
+        mlp._gate_weight_t = None
+        mlp._up_weight_t   = None
+        # Patch：M=1 时走 standard（GEMV）路径，绕过 fused GEMM padding
+        _patch_mlp_for_gemv(mlp)
+
+    # ── 3. 替换 lm_head ───────────────────────────────────────────────────
+    _replace_linear(model, "lm_head", mode)
+    replaced += 1
+
+    print(f"完成：共替换 {replaced} 个 Linear 层。")
+    print(f"  text_decoder.layers × {len(decoder.layers)}: "
+          f"4 attention + 3 MLP = 7 层/每层")
+    print(f"  lm_head: 1 层")
+    _print_memory_savings(model, mode)
+
+
+def _print_memory_savings(model, mode: str):
+    """打印权重显存节省量。"""
+    decoder = model.text_decoder
+    cfg = model.config
+    L  = cfg.text_num_layers
+    H  = cfg.text_hidden_size
+    KH = cfg.text_num_kv_heads * (H // cfg.text_num_heads)  # kv head size
+    I  = cfg.text_intermediate_size
+    V  = cfg.text_vocab_size
+
+    # 权重矩阵大小（元素数）
+    total_elements = L * (
+        H * H          +   # q_proj
+        H * KH         +   # k_proj
+        H * KH         +   # v_proj
+        H * H          +   # o_proj
+        H * I          +   # gate_proj
+        H * I          +   # up_proj
+        I * H              # down_proj
+    ) + H * V              # lm_head
+
+    bytes_fp32 = total_elements * 4
+    bytes_opt  = total_elements * (2 if mode == "fp16" else 1 if mode == "int8" else 4)
+    saved_mb   = (bytes_fp32 - bytes_opt) / 1e6
+
+    print(f"\n  权重显存: FP32={bytes_fp32/1e9:.2f} GB → {mode.upper()}={bytes_opt/1e9:.2f} GB")
+    print(f"  节省: {saved_mb:.0f} MB ({(1-bytes_opt/bytes_fp32)*100:.0f}% HBM 带宽减少)")
+
+
+# ============================================================================
 # 正确性验证
 # ============================================================================
 
