@@ -7,6 +7,24 @@ import triton
 import triton.language as tl
 import numpy as np
 
+
+ATTN_LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def _select_attention_compute_dtype(x: torch.Tensor) -> torch.dtype:
+    if x.dtype in ATTN_LOW_PRECISION_DTYPES:
+        return x.dtype
+    if x.is_cuda and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _to_compute_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if x.dtype == dtype and x.is_contiguous():
+        return x
+    return x.to(dtype=dtype).contiguous()
+
+
 @triton.jit
 def flash_attention_kernel(
     q_ptr, k_ptr, v_ptr, output_ptr,
@@ -58,7 +76,7 @@ def flash_attention_kernel(
         k = tl.load(k_ptrs, mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0)
 
         # 计算局部 scores: (BLOCK_Q, BLOCK_K)
-        scores = tl.dot(q, tl.trans(k)) * scale
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
 
         # Causal mask: 只允许看到不超过自身位置的 token
         if is_causal:
@@ -86,7 +104,7 @@ def flash_attention_kernel(
         v = tl.load(v_ptrs, mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0)
 
         # 累积 weighted sum
-        acc = acc + tl.dot(exp_scores.to(tl.float32), v.to(tl.float32))
+        acc = acc + tl.dot(exp_scores.to(tl.float32), v.to(tl.float32), out_dtype=tl.float32)
 
         # 更新最大值
         m = m_new
@@ -111,10 +129,23 @@ def flash_attention(q, k, v, is_causal=False, scale=None):
     BLOCK_K = 16
     BLOCK_D = triton.next_power_of_2(head_dim)
 
-    q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
-    k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
-    v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
-    output = torch.zeros_like(q_flat)
+    compute_dtype = _select_attention_compute_dtype(q)
+    output_dtype = q.dtype
+
+    q_flat = _to_compute_dtype(q.reshape(batch * num_heads, seq_q, head_dim), compute_dtype)
+    k_flat = _to_compute_dtype(k.reshape(batch * num_heads, seq_k, head_dim), compute_dtype)
+    v_flat = _to_compute_dtype(v.reshape(batch * num_heads, seq_k, head_dim), compute_dtype)
+
+    if head_dim != BLOCK_D:
+        def pad_dim(x):
+            padded = torch.zeros((x.shape[0], x.shape[1], BLOCK_D), dtype=compute_dtype, device=x.device)
+            padded[:, :, :head_dim] = x
+            return padded
+        q_flat = pad_dim(q_flat)
+        k_flat = pad_dim(k_flat)
+        v_flat = pad_dim(v_flat)
+
+    output = torch.zeros((batch * num_heads, seq_q, BLOCK_D), dtype=torch.float32, device=q.device)
 
     grid = (batch * num_heads, triton.cdiv(seq_q, BLOCK_Q))
     flash_attention_kernel[grid](
@@ -130,7 +161,8 @@ def flash_attention(q, k, v, is_causal=False, scale=None):
         BLOCK_K=BLOCK_K,
         BLOCK_D=BLOCK_D,
     )
-    return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+    output = output[:, :, :head_dim]
+    return output.reshape(batch, num_heads, seq_q, head_dim).to(output_dtype)
 
 
 def reference_attention(q, k, v, is_causal=False, scale=None):
