@@ -11,7 +11,7 @@ import torch
 import triton
 import triton.language as tl
 from typing import Optional, Tuple
-from FlashAttention import flash_attention_kernel
+from FlashAttention import flash_attention
 
 def get_stream():
     """Get current CUDA stream pointer."""
@@ -291,6 +291,168 @@ def next_power_of_two(x: int) -> int:
 
 
 MAX_ATTENTION_DIM = 256
+
+
+def flash_attention_mixed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Mixed precision FlashAttention wrapper."""
+    return flash_attention(q, k, v, is_causal=is_causal, scale=scale)
+
+
+def scaled_dot_product_attention_pytorch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Reference PyTorch attention path with FP32 softmax for numerical stability."""
+    _, _, seq_q, head_dim = q.shape
+    _, _, seq_k, _ = k.shape
+
+    if scale is None:
+        scale = 1.0 / np.sqrt(head_dim)
+
+    scores = torch.einsum("bnqd,bnkd->bnqk", q.to(torch.float32), k.to(torch.float32)) * scale
+    if is_causal:
+        causal = torch.triu(
+            torch.ones((seq_q, seq_k), dtype=torch.bool, device=q.device), diagonal=1
+        )
+        scores = scores.masked_fill(causal[None, None, :, :], float("-inf"))
+    if attention_mask is not None:
+        scores = scores + attention_mask.to(scores.dtype)
+
+    scores = scores - torch.max(scores, dim=-1, keepdim=True).values
+    attn = torch.softmax(scores, dim=-1)
+    output = torch.einsum("bnqk,bnkd->bnqd", attn, v.to(torch.float32))
+    return output.to(q.dtype)
+
+
+def scaled_dot_product_attention_triton_mixed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    is_causal: bool = False,
+    scale: Optional[float] = None,
+) -> torch.Tensor:
+    """Triton mixed precision path for masked attention."""
+    batch, num_heads, seq_q, head_dim = q.shape
+    _, _, seq_k, _ = k.shape
+
+    if scale is None:
+        scale = 1.0 / np.sqrt(head_dim)
+
+    seq_k_padded = next_power_of_two(seq_k)
+    head_dim_padded = next_power_of_two(head_dim)
+
+    q_flat = q.reshape(batch * num_heads, seq_q, head_dim).contiguous()
+    k_flat = k.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+    v_flat = v.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+
+    if seq_k_padded != seq_k or head_dim_padded != head_dim:
+        kv_dtype = k_flat.dtype
+        q_padded = torch.zeros(
+            (batch * num_heads, seq_q, head_dim_padded), dtype=q_flat.dtype, device=q.device
+        )
+        k_padded = torch.zeros(
+            (batch * num_heads, seq_k_padded, head_dim_padded), dtype=kv_dtype, device=q.device
+        )
+        v_padded = torch.zeros_like(k_padded)
+        q_padded[:, :, :head_dim] = q_flat
+        k_padded[:, :seq_k, :head_dim] = k_flat
+        v_padded[:, :seq_k, :head_dim] = v_flat
+        q_flat, k_flat, v_flat = q_padded, k_padded, v_padded
+
+    scores = torch.empty(
+        (batch * num_heads, seq_q, seq_k_padded), dtype=torch.float32, device=q.device
+    )
+    output = torch.empty(
+        (batch * num_heads, seq_q, head_dim_padded), dtype=q.dtype, device=q.device
+    )
+
+    grid = (batch * num_heads, seq_q)
+    attention_scores_kernel[grid](
+        q_flat,
+        k_flat,
+        scores,
+        float(scale),
+        seq_k_padded,
+        head_dim_padded,
+        q_flat.stride(0),
+        q_flat.stride(1),
+        q_flat.stride(2),
+        k_flat.stride(0),
+        k_flat.stride(1),
+        k_flat.stride(2),
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        BLOCK_K=seq_k_padded,
+        BLOCK_D=head_dim_padded,
+    )
+
+    if seq_k_padded != seq_k:
+        scores[:, :, seq_k:] = -1e9
+
+    if is_causal:
+        causal = torch.triu(
+            torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device), diagonal=1
+        ) * -1e9
+        scores = scores + causal[None, :, :]
+
+    if attention_mask is not None:
+        if attention_mask.ndim == 4:
+            attention_mask = attention_mask.reshape(batch * num_heads, seq_q, seq_k)
+        attention_mask = attention_mask.to(torch.float32)
+        if seq_k_padded != seq_k:
+            mask_padded = torch.zeros(
+                (batch * num_heads, seq_q, seq_k_padded), dtype=torch.float32, device=q.device
+            )
+            mask_padded[:, :, :seq_k] = attention_mask
+            mask_padded[:, :, seq_k:] = -1e9
+            attention_mask = mask_padded
+        scores = scores + attention_mask
+
+    scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
+    softmax_inplace_kernel[(scores_2d.shape[0],)](
+        scores_2d,
+        scores_2d.stride(0),
+        seq_k_padded,
+        BLOCK_SIZE=seq_k_padded,
+    )
+    scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+
+    attention_output_kernel[grid](
+        scores,
+        v_flat,
+        output,
+        seq_k_padded,
+        head_dim_padded,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        v_flat.stride(0),
+        v_flat.stride(1),
+        v_flat.stride(2),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        BLOCK_K=seq_k_padded,
+        BLOCK_D=head_dim_padded,
+    )
+
+    if head_dim_padded != head_dim:
+        output = output[:, :, :head_dim]
+    return output.reshape(batch, num_heads, seq_q, head_dim)
+
+
 def scaled_dot_product_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -326,7 +488,7 @@ def scaled_dot_product_attention(
     head_dim_padded = next_power_of_two(head_dim)
     seq_k_padded = next_power_of_two(seq_k)
     
-    if q.is_cuda and seq_k_padded <= 256 and head_dim_padded <= 256:
+    if q.is_cuda and seq_k_padded <= MAX_ATTENTION_DIM and head_dim_padded <= MAX_ATTENTION_DIM:
         return scaled_dot_product_attention_triton_mixed(
             q_mixed, k_mixed, v_mixed,
             attention_mask, is_causal, scale
