@@ -290,7 +290,36 @@ def next_power_of_two(x: int) -> int:
     return 1 << (x - 1).bit_length() if x > 0 else 1
 
 
-MAX_ATTENTION_DIM = 256
+MAX_ATTENTION_DIM = 1024
+ATTN_LOW_PRECISION_DTYPES = (torch.float16, torch.bfloat16)
+_ATTN_COMPUTE_DTYPE_OVERRIDE: Optional[torch.dtype] = None
+
+
+def set_attention_compute_dtype(dtype: Optional[torch.dtype]) -> None:
+    """
+    Session-level attention compute dtype override.
+    Use None to restore automatic selection.
+    """
+    global _ATTN_COMPUTE_DTYPE_OVERRIDE
+    _ATTN_COMPUTE_DTYPE_OVERRIDE = dtype
+
+
+def _select_attention_compute_dtype(x: torch.Tensor) -> torch.dtype:
+    """Choose low-precision dtype for attention IO to reduce memory bandwidth."""
+    if _ATTN_COMPUTE_DTYPE_OVERRIDE is not None:
+        return _ATTN_COMPUTE_DTYPE_OVERRIDE
+    if x.dtype in ATTN_LOW_PRECISION_DTYPES:
+        return x.dtype
+    if x.is_cuda and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def _to_compute_dtype(x: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Move dtype conversion to function entry to avoid repeated branch-local `.to()`."""
+    if x.dtype == dtype and x.is_contiguous():
+        return x
+    return x.to(dtype=dtype).contiguous()
 
 """
 def scaled_dot_product_attention(
@@ -472,6 +501,8 @@ def scaled_dot_product_attention(
         scale = 1.0 / np.sqrt(head_dim)
 
     head_dim_padded = next_power_of_two(head_dim)
+    compute_dtype = _select_attention_compute_dtype(q)
+    output_dtype = q.dtype
 
     # ----------------------------------------------------------------
     # 路径 1: Flash Attention（无 attention_mask，有 GPU）
@@ -481,16 +512,22 @@ def scaled_dot_product_attention(
         BLOCK_K = 16
         BLOCK_D = head_dim_padded
 
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+        q_flat = _to_compute_dtype(
+            q.reshape(batch * num_heads, seq_q, head_dim), compute_dtype
+        )
+        k_flat = _to_compute_dtype(
+            k.reshape(batch * num_heads, seq_k, head_dim), compute_dtype
+        )
+        v_flat = _to_compute_dtype(
+            v.reshape(batch * num_heads, seq_k, head_dim), compute_dtype
+        )
 
         # 如果 head_dim 不是 2 的幂次，pad 到 BLOCK_D
         if head_dim != BLOCK_D:
             def pad_dim(x, target_dim):
                 padded = torch.zeros(
                     (x.shape[0], x.shape[1], target_dim),
-                    dtype=torch.float32, device=x.device
+                    dtype=compute_dtype, device=x.device
                 )
                 padded[:, :, :head_dim] = x
                 return padded
@@ -522,10 +559,10 @@ def scaled_dot_product_attention(
         if head_dim != BLOCK_D:
             output = output[:, :, :head_dim]
 
-        return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+        return output.reshape(batch, num_heads, seq_q, head_dim).to(output_dtype)
 
     # ----------------------------------------------------------------
-    # 路径 2: 原始 Triton 三步（有 attention_mask，seq_k <= 256）
+    # 路径 2: 原始 Triton 三步（有 attention_mask，扩展到更长 seq_k）
     # ----------------------------------------------------------------
     seq_k_padded = next_power_of_two(seq_k)
 
@@ -536,19 +573,25 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
+        q_flat = _to_compute_dtype(
+            q.reshape(batch * num_heads, seq_q, head_dim), compute_dtype
+        )
+        k_flat = _to_compute_dtype(
+            k.reshape(batch * num_heads, seq_k, head_dim), compute_dtype
+        )
+        v_flat = _to_compute_dtype(
+            v.reshape(batch * num_heads, seq_k, head_dim), compute_dtype
+        )
 
         if seq_k_padded != seq_k or head_dim_padded != head_dim:
             k_padded = torch.zeros(
                 (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32, device=q.device,
+                dtype=compute_dtype, device=q.device,
             )
             v_padded = torch.zeros_like(k_padded)
             q_padded = torch.zeros(
                 (batch * num_heads, seq_q, head_dim_padded),
-                dtype=torch.float32, device=q.device,
+                dtype=compute_dtype, device=q.device,
             )
             k_padded[:, :seq_k, :head_dim] = k_flat
             v_padded[:, :seq_k, :head_dim] = v_flat
@@ -619,7 +662,7 @@ def scaled_dot_product_attention(
         if head_dim_padded != head_dim:
             output = output[:, :, :head_dim]
 
-        return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
+        return output.reshape(batch, num_heads, seq_q, head_dim).to(output_dtype)
 
     # ----------------------------------------------------------------
     # 路径 3: 纯 PyTorch fallback（无 GPU，或超长序列+有 mask）
