@@ -144,7 +144,7 @@ def flash_attention_kernel_mixed(
         offs_k = k_start + tl.arange(0, BLOCK_K)
         
         # 加载 FP16 K
-        k_ptrs = k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_q1 + offs_d[None, :] * stride_q2
+        k_ptrs = k_ptr + pid_bh * stride_k0 + offs_k[:, None] * stride_k1 + offs_d[None, :] * stride_k2
         k = tl.load(k_ptrs, 
                     mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), 
                     other=0.0).to(tl.float16)
