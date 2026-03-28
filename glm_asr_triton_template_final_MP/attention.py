@@ -491,7 +491,7 @@ def scaled_dot_product_attention(
             def pad_dim(x, target_dim):
                 padded = torch.zeros(
                     (x.shape[0], x.shape[1], target_dim),
-                    dtype=torch.float32, device=x.device
+                    dtype=q.dtype, device=x.device
                 )
                 padded[:, :, :head_dim] = x
                 return padded
@@ -501,7 +501,7 @@ def scaled_dot_product_attention(
 
         output = torch.zeros(
             (batch * num_heads, seq_q, BLOCK_D),
-            dtype=torch.float32, device=q.device
+            dtype=q.dtype, device=q.device
         )
 
         grid = (batch * num_heads, triton.cdiv(seq_q, BLOCK_Q))

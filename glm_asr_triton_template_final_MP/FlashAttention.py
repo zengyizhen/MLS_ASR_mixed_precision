@@ -60,19 +60,21 @@ def flash_attention_kernel(
 
         # 计算局部 scores: (BLOCK_Q, BLOCK_K)
         # scores = tl.dot(q, tl.trans(k)) * scale
-        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
-
+        # scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float16) * scale  # 使用 fp16 乘法
+        # 但 scores 需要用于 softmax，需转为 fp32
+        scores_fp32 = scores.to(tl.float32)  
         # Causal mask: 只允许看到不超过自身位置的 token
         if is_causal:
             causal_mask = offs_q[:, None] >= offs_k[None, :]
-            scores = tl.where(causal_mask, scores, float("-inf"))
+            scores_fp32 = tl.where(causal_mask, scores_fp32, float("-inf"))
 
         # Padding mask
-        scores = tl.where(offs_k[None, :] < seq_k, scores, float("-inf"))
+        scores_fp32 = tl.where(offs_k[None, :] < seq_k, scores_fp32, float("-inf"))
 
         # Online softmax 更新
         # 新的最大值
-        m_new = tl.maximum(m, tl.max(scores, axis=1))  # (BLOCK_Q,)
+        m_new = tl.maximum(m, tl.max(scores_fp32, axis=1))  # (BLOCK_Q,)
 
         # 修正旧的累积值
         alpha = tl.exp(m - m_new)           # (BLOCK_Q,)  rescale factor
@@ -80,7 +82,7 @@ def flash_attention_kernel(
         acc = acc * alpha[:, None]           # 修正旧的 output 累积
 
         # 当前 block 的 exp scores
-        exp_scores = tl.exp(scores - m_new[:, None])  # (BLOCK_Q, BLOCK_K)
+        exp_scores = tl.exp(scores_fp32 - m_new[:, None])  # (BLOCK_Q, BLOCK_K)
         l = l + tl.sum(exp_scores, axis=1)            # 累积新的 sum
 
         # 加载 V block: (BLOCK_K, BLOCK_D)
@@ -105,6 +107,7 @@ def flash_attention_kernel(
 
 def flash_attention(q, k, v, is_causal=False, scale=None):
     """Flash attention wrapper."""
+    
     batch, num_heads, seq_q, head_dim = q.shape
     _, _, seq_k, _ = k.shape
 

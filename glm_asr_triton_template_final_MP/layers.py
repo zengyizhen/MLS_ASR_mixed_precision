@@ -877,7 +877,7 @@ class Linear:
         if M_padded > M or self._K_padded > K:
             x_padded = torch.zeros(
                 (M_padded, self._K_padded),
-                dtype=torch.float32,
+                dtype=x.dtype,
                 device=x.device,
             )
             x_padded[:M, :K] = x_2d
@@ -885,7 +885,7 @@ class Linear:
             x_padded = x_2d
 
         output = torch.zeros(
-            (M_padded, self._N_padded), dtype=torch.float32, device=x.device
+            (M_padded, self._N_padded), dtype=x.dtype, device=x.device
         )
 
         grid = (
