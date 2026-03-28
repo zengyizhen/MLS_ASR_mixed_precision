@@ -182,46 +182,59 @@ def linear_kernel_tf32(
     a_ptr,
     b_ptr,
     c_ptr,
-    bias_ptr,                  # 新增
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    HAS_BIAS: tl.constexpr,    # 新增，编译期常量
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
+    """
+    TF32-style matmul: output = A @ B.
+    A: (M, K), B: (K, N), C: (M, N)
+
+    *** TODO: Implement this kernel ***
+
+    Grid: (M // BLOCK_M, N // BLOCK_N)
+    """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # ============================================================================
+    # TODO: Implement tiled matrix multiplication
+    # ============================================================================
+    #
+    # Step 1: Initialize accumulator
+    # Step 2: Loop over K tiles and accumulate tl.dot
+    # Step 3: Store the result
+
+    offs_m = pid_m * BLOCK_M+tl.arange(0,BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-
-    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
     for k in range(0, K, BLOCK_K):
-        a_mask = (offs_m[:, None] < M) & (k + offs_k[None, :] < K)
-        b_mask = (k + offs_k[:, None] < K) & (offs_n[None, :] < N)
-        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
-        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
-        acc += tl.dot(a, b)
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # 融合 bias 加法
-    if HAS_BIAS:
-        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
-        acc += bias[None, :]
-
-    c_ptrs = c_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
-    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=c_mask)
-    
+            a = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
+                mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
+                other=0.0,
+            )
+            b = tl.load(
+                b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+                mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+                other=0.0,
+            )
+            acc += tl.dot(a, b)
+    tl.store(
+        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
 
 
 
@@ -883,7 +896,6 @@ class Linear:
             x_padded,
             self._weight_t_padded,
             output,
-            bias_ptr,
             M_padded,
             self._N_padded,
             self._K_padded,
@@ -893,13 +905,17 @@ class Linear:
             self._weight_t_padded.stride(1),
             output.stride(0),
             output.stride(1),
-            HAS_BIAS=has_bias,
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
         )
 
         output = output[:M, :N]
+
+        if self.has_bias and self.bias_param is not None:
+            if self.bias_param.device != x.device:
+                self.bias_param = self.bias_param.to(x.device)
+            output = output + self.bias_param
 
         return output.reshape(*batch_dims, self.out_features)
 
