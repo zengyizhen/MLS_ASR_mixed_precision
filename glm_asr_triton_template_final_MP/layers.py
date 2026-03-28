@@ -573,8 +573,8 @@ def fused_add_rmsnorm_kernel(
     res_ptrs = residual_ptr + row_idx * stride_res_row + offsets
 
     # Step 1: Load both x and residual into SRAM
-    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
-    res = tl.load(res_ptrs, mask=mask, other=0.0).to(tl.float32)
+    x = tl.load(x_ptrs, mask=mask, other=0.0)#.to(tl.float32)
+    res = tl.load(res_ptrs, mask=mask, other=0.0)#.to(tl.float32)
 
     # Step 2: Fused addition in registers
     x_new = x + res
@@ -589,7 +589,7 @@ def fused_add_rmsnorm_kernel(
 
     # Load weight and calculate final normalized output
     weight_ptrs = weight_ptr + offsets
-    weight = tl.load(weight_ptrs, mask=mask, other=0.0).to(tl.float32)
+    weight = tl.load(weight_ptrs, mask=mask, other=0.0)#.to(tl.float32)
     y = x_new * rsqrt * weight
 
     # Step 5: Store the final normalized output

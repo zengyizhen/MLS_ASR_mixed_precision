@@ -481,9 +481,10 @@ def scaled_dot_product_attention(
         BLOCK_K = 16
         BLOCK_D = head_dim_padded
 
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).contiguous()
+        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+        #compute_dtype = torch.float32
 
         # 如果 head_dim 不是 2 的幂次，pad 到 BLOCK_D
         if head_dim != BLOCK_D:
@@ -536,9 +537,9 @@ def scaled_dot_product_attention(
     )
 
     if use_triton:
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
+        q_flat = q.reshape(batch * num_heads, seq_q, head_dim)
+        k_flat = k.reshape(batch * num_heads, seq_k, head_dim)
+        v_flat = v.reshape(batch * num_heads, seq_k, head_dim)
 
         if seq_k_padded != seq_k or head_dim_padded != head_dim:
             k_padded = torch.zeros(

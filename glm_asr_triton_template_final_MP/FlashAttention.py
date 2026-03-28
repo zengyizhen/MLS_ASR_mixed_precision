@@ -46,6 +46,7 @@ def flash_attention_kernel(
     m = tl.full((BLOCK_Q,), float("-inf"), dtype=tl.float32)
     l = tl.zeros((BLOCK_Q,), dtype=tl.float32)
     acc = tl.zeros((BLOCK_Q, BLOCK_D), dtype=tl.float32)
+    
 
     # 遍历所有 K/V blocks
     num_k_blocks = tl.cdiv(seq_k, BLOCK_K)
@@ -58,7 +59,8 @@ def flash_attention_kernel(
         k = tl.load(k_ptrs, mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0)
 
         # 计算局部 scores: (BLOCK_Q, BLOCK_K)
-        scores = tl.dot(q, tl.trans(k)) * scale
+        # scores = tl.dot(q, tl.trans(k)) * scale
+        scores = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * scale
 
         # Causal mask: 只允许看到不超过自身位置的 token
         if is_causal:
@@ -86,13 +88,15 @@ def flash_attention_kernel(
         v = tl.load(v_ptrs, mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim), other=0.0)
 
         # 累积 weighted sum
-        acc = acc + tl.dot(exp_scores.to(tl.float32), v.to(tl.float32))
+        #acc = acc + tl.dot(exp_scores.to(tl.float32), v.to(tl.float32))
+        acc += tl.dot(exp_scores, v, out_dtype=tl.float32)
 
         # 更新最大值
         m = m_new
 
     # 最终归一化
     acc = acc / l[:, None]
+    acc = acc.to(tl.float16)
 
     # 写回输出
     out_ptrs = output_ptr + pid_bh * stride_o0 + offs_q[:, None] * stride_o1 + offs_d[None, :] * stride_o2
@@ -111,9 +115,9 @@ def flash_attention(q, k, v, is_causal=False, scale=None):
     BLOCK_K = 16
     BLOCK_D = triton.next_power_of_2(head_dim)
 
-    q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32).contiguous()
-    k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
-    v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32).contiguous()
+    q_flat = q.reshape(batch * num_heads, seq_q, head_dim).contiguous()
+    k_flat = k.reshape(batch * num_heads, seq_k, head_dim).contiguous()
+    v_flat = v.reshape(batch * num_heads, seq_k, head_dim).contiguous()
     output = torch.zeros_like(q_flat)
 
     grid = (batch * num_heads, triton.cdiv(seq_q, BLOCK_Q))
