@@ -70,7 +70,7 @@ def rmsnorm_kernel(
     # Step 4: Apply weight and store
     offs = tl.arange(0,BLOCK_SIZE)
     mask = offs< hidden_size
-    x =tl.load(x_ptr+pid*stride_x+offs,mask=mask,other = 0.0).to(tl.float32)
+    x =tl.load(x_ptr+pid*stride_x+offs,mask=mask,other = 0.0)#.to(tl.float32)
     var = tl.sum(x*x,axis = 0)/hidden_size
     x_norm = x*tl.rsqrt(var+eps)
     w = tl.load(w_ptr+offs,mask=mask,other = 0.0)
@@ -112,7 +112,7 @@ def layernorm_kernel(
 
     offs = tl.arange(0,BLOCK_SIZE)
     mask = offs < hidden_size
-    x = tl.load(x_ptr+pid*stride_x+offs,mask = mask,other=0.0).to(tl.float32)
+    x = tl.load(x_ptr+pid*stride_x+offs,mask = mask,other=0.0)#.to(tl.float32)
 
     mean=tl.sum(x,axis =0)/hidden_size
     x_centered = x - mean
@@ -144,7 +144,7 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0,BLOCK_SIZE)
     mask = offs < n_elements
-    x = tl.load(x_ptr+offs, mask=mask, other = 0.0).to(tl.float32)
+    x = tl.load(x_ptr+offs, mask=mask, other = 0.0)#.to(tl.float32)
     sqrt_2_over_pi = 0.7978845608028654
     x3 = x*x*x
     inner = sqrt_2_over_pi * (x + 0.044715 * x3)
@@ -171,7 +171,7 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0,BLOCK_SIZE)
     mask = offs < n_elements
-    x = tl.load(x_ptr+offs, mask = mask,other = 0.0).to(tl.float32)
+    x = tl.load(x_ptr+offs, mask = mask,other = 0.0)#.to(tl.float32)
     sigmoid = 1.0 / (1.0+tl.exp(-x))
     y = x * sigmoid
     tl.store(y_ptr+offs,y,mask=mask)
@@ -664,7 +664,7 @@ class RMSNorm:
             # ==========================================
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
-            x_flat = x_flat.to(torch.float32)
+            #x_flat = x_flat.to(torch.float32)
             output = torch.empty_like(x_flat)
 
             block = next_power_of_two(self.hidden_size)
@@ -711,7 +711,7 @@ class LayerNorm:
         if self.use_triton and x.is_cuda:
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
-            x_flat = x_flat.to(torch.float32)
+            #x_flat = x_flat.to(torch.float32)
             output = torch.empty_like(x_flat)
 
             if self.weight.device != x.device:
@@ -733,7 +733,7 @@ class LayerNorm:
             )
             return output.reshape(original_shape)
 
-        x_float = x.to(torch.float32)
+        x_float = x#.to(torch.float32)
         mean = torch.mean(x_float, dim=-1, keepdim=True)
         variance = torch.var(x_float, dim=-1, keepdim=True, unbiased=False)
         x_normed = (x_float - mean) * torch.rsqrt(variance + self.eps)
@@ -750,7 +750,7 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     total = int(np.prod(x.shape))
     block = 256
 
-    x_flat = x.reshape(-1).contiguous().to(torch.float32)
+    x_flat = x.reshape(-1).contiguous()#.to(torch.float32)
     output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
@@ -767,7 +767,7 @@ def silu(x: torch.Tensor) -> torch.Tensor:
     total = int(np.prod(x.shape))
     block = 256
 
-    x_flat = x.reshape(-1).contiguous().to(torch.float32)
+    x_flat = x.reshape(-1).contiguous()#.to(torch.float32)
     output = torch.empty_like(x_flat)
     grid = (triton.cdiv(total, block),)
 
@@ -843,7 +843,7 @@ class Linear:
         batch_dims = original_shape[:-1]
 
         M = int(np.prod(batch_dims))
-        x_2d = x.reshape(M, self.in_features).to(torch.float32)
+        x_2d = x.reshape(M, self.in_features)#.to(torch.float32)
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
@@ -865,7 +865,7 @@ class Linear:
         K = self.in_features
         N = self.out_features
 
-        x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+        x_2d = x.reshape(M, K).contiguous()#.to(torch.float32)
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
@@ -972,7 +972,7 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
     batch_size = int(np.prod(x.shape[:-1]))
     seq_len = x.shape[-1]
 
-    x_flat = x.reshape(batch_size, seq_len).to(torch.float32).contiguous()
+    x_flat = x.reshape(batch_size, seq_len).contiguous()#.to(torch.float32).
     output = torch.empty_like(x_flat)
 
     if x.is_cuda:
