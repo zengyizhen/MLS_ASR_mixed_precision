@@ -301,13 +301,15 @@ class DecoderLayer:
         attn_output = self.attention(q, k, v, attention_mask, is_causal and past_key_value is None)
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch, seq_len, -1)
 
-        # Output projection + residual
-        hidden_states = self.o_proj(attn_output)
-        hidden_states = residual + hidden_states
+        # 1. 投影输出 (换个名字叫 attn_out，避免覆盖)
+        attn_out = self.o_proj(attn_output)
+        
+        # 2. 触发融合: 
+        #    - residual 会在底层被原地更新为: residual_old + attn_out
+        #    - hidden_states 接收的是归一化后的结果: RMSNorm(residual_new)
+        hidden_states = self.post_attention_layernorm(attn_out, residual=residual)
 
-        # MLP with pre-norm
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # 3. 直接进入 MLP (旧的 residual 赋值和第二次 norm 已经被删除了)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -371,13 +373,9 @@ class DecoderLayer:
         attn_output = self.attention(q, k_for_attn, v_for_attn, None, cache_pos == 0)
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch, seq_len, -1)
 
-        # Output projection + residual
-        hidden_states = self.o_proj(attn_output)
-        hidden_states = residual + hidden_states
+        attn_out = self.o_proj(attn_output)
+        hidden_states = self.post_attention_layernorm(attn_out, residual=residual)
 
-        # MLP with pre-norm
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
