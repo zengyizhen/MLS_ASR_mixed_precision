@@ -292,165 +292,6 @@ def next_power_of_two(x: int) -> int:
 
 MAX_ATTENTION_DIM = 256
 
-"""
-def scaled_dot_product_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    is_causal: bool = False,
-    scale: Optional[float] = None,
-) -> torch.Tensor:
-    
-    #Scaled dot-product attention using Triton kernels.
-    
-    batch, num_heads, seq_q, head_dim = q.shape
-    _, _, seq_k, _ = k.shape
-
-    if scale is None:
-        scale = 1.0 / np.sqrt(head_dim)
-
-    seq_k_padded = next_power_of_two(seq_k)
-    head_dim_padded = next_power_of_two(head_dim)
-
-    use_triton = (
-        q.is_cuda
-        and seq_k_padded <= MAX_ATTENTION_DIM
-        and head_dim_padded <= MAX_ATTENTION_DIM
-    )
-
-    if use_triton:
-        q_flat = q.reshape(batch * num_heads, seq_q, head_dim).to(torch.float32)
-        k_flat = k.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-        v_flat = v.reshape(batch * num_heads, seq_k, head_dim).to(torch.float32)
-
-        if seq_k_padded != seq_k or head_dim_padded != head_dim:
-            k_padded = torch.zeros(
-                (batch * num_heads, seq_k_padded, head_dim_padded),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            v_padded = torch.zeros_like(k_padded)
-            q_padded = torch.zeros(
-                (batch * num_heads, seq_q, head_dim_padded),
-                dtype=torch.float32,
-                device=q.device,
-            )
-            k_padded[:, :seq_k, :head_dim] = k_flat
-            v_padded[:, :seq_k, :head_dim] = v_flat
-            q_padded[:, :, :head_dim] = q_flat
-            k_flat = k_padded
-            v_flat = v_padded
-            q_flat = q_padded
-
-        scores = torch.empty(
-            (batch * num_heads, seq_q, seq_k_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        output = torch.empty(
-            (batch * num_heads, seq_q, head_dim_padded),
-            dtype=torch.float32,
-            device=q.device,
-        )
-
-        grid = (batch * num_heads, seq_q)
-        attention_scores_kernel[grid](
-            q_flat,
-            k_flat,
-            scores,
-            float(scale),
-            seq_k_padded,
-            head_dim_padded,
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-        )
-
-        if seq_k_padded != seq_k:
-            scores[:, :, seq_k:] = -1e9
-
-        if is_causal:
-            mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
-                diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
-
-        if attention_mask is not None:
-            if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
-            if seq_k_padded != seq_k:
-                mask_padded = torch.zeros(
-                    (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                mask_padded[:, :, :seq_k] = attention_mask
-                mask_padded[:, :, seq_k:] = -1e9
-                attention_mask = mask_padded
-            scores = scores + attention_mask
-
-        scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
-        block = seq_k_padded
-        softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
-        )
-        scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
-
-        attention_output_kernel[grid](
-            scores,
-            v_flat,
-            output,
-            seq_k_padded,
-            head_dim_padded,
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            v_flat.stride(0),
-            v_flat.stride(1),
-            v_flat.stride(2),
-            output.stride(0),
-            output.stride(1),
-            output.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
-        )
-
-        if head_dim_padded != head_dim:
-            output = output[:, :, :head_dim]
-
-        return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
-
-    scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
-
-    if is_causal:
-        mask = torch.triu(
-            torch.ones((seq_q, seq_k), dtype=torch.float32, device=q.device),
-            diagonal=1,
-        ) * -1e9
-        scores = scores + mask[None, None, :, :]
-
-    if attention_mask is not None:
-        scores = scores + attention_mask
-
-    scores = scores - torch.max(scores, dim=-1, keepdim=True).values
-    attn_weights = torch.exp(scores)
-    attn_weights = attn_weights / torch.sum(attn_weights, dim=-1, keepdim=True)
-    output = torch.einsum("bnqk,bnkd->bnqd", attn_weights, v)
-
-    return output.to(q.dtype)
-"""
 def scaled_dot_product_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -474,7 +315,7 @@ def scaled_dot_product_attention(
     head_dim_padded = next_power_of_two(head_dim)
 
     # ----------------------------------------------------------------
-    # 路径 1: Flash Attention（无 attention_mask，有 GPU）
+    #  Flash Attention（无 attention_mask，有 GPU）
     # ----------------------------------------------------------------
     if q.is_cuda and attention_mask is None:
         BLOCK_Q = 16
@@ -526,7 +367,7 @@ def scaled_dot_product_attention(
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
     # ----------------------------------------------------------------
-    # 路径 2: 原始 Triton 三步（有 attention_mask，seq_k <= 256）
+    # 原始 Triton 三步（有 attention_mask，seq_k <= 256）
     # ----------------------------------------------------------------
     seq_k_padded = next_power_of_two(seq_k)
 
@@ -623,7 +464,7 @@ def scaled_dot_product_attention(
         return output.reshape(batch, num_heads, seq_q, head_dim).to(q.dtype)
 
     # ----------------------------------------------------------------
-    # 路径 3: 纯 PyTorch fallback（无 GPU，或超长序列+有 mask）
+    # 纯 PyTorch fallback（无 GPU，或超长序列+有 mask）
     # ----------------------------------------------------------------
     scores = torch.einsum("bnqd,bnkd->bnqk", q, k) * scale
 

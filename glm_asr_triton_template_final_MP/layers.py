@@ -259,7 +259,6 @@ def gemv_fp16_kernel(
       - 不再将 M 从 1 pad 到 128（消除 127× 计算浪费）
       - 权重 FP16 存储，HBM 带宽减半
       - x 向量在 BLOCK_N 行之间寄存器复用
-    适用范围：N >= 9000 的大矩阵（gate_proj / up_proj）
     """
     pid    = tl.program_id(0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -697,16 +696,13 @@ class RMSNorm:
 
         if self.use_triton and x.is_cuda:
             # ==========================================
-            # 🚀 进阶融合分支 (原创设计：Fused Add + RMSNorm)
+            # Fused Add + RMSNorm
             # ==========================================
             if residual is not None:
-                # 调用我们在文件底部写好的 Triton 融合算子
-                # 注意：传入的 residual 张量将会被原地 (in-place) 更新！
+               
                 return fused_add_rmsnorm(x, residual, self.weight, self.eps)
 
-            # ==========================================
-            # 🐌 标准朴素分支 (完全保留原汁原味的老师代码)
-            # ==========================================
+          
             batch_size = int(np.prod(x.shape[:-1]))
             x_flat = x.reshape(batch_size, self.hidden_size).contiguous()
             #x_flat = x_flat.to(torch.float32)
@@ -726,10 +722,9 @@ class RMSNorm:
             return output.reshape(original_shape)
 
         # ==========================================
-        # 🛠️ PyTorch Fallback 后备分支 (CPU 或维度非 2 的幂)
+        # PyTorch
         # ==========================================
         if residual is not None:
-            # 在纯 PyTorch 模式下，我们也必须手动模拟“原地相加”的逻辑
             residual.add_(x) 
             x_float = residual.to(torch.float32)
         else:
@@ -842,8 +837,6 @@ class Linear:
 
     # ── FP16 GEMV 控制 ────────────────────────────────────────────────────
     # M=1（decode 步）时：走 FP16 GEMV kernel
-    # 依据 benchmark：gate_proj(N=18944) FP16 GEMV 比 cuBLAS 快 1.83×
-    #                 q_proj(N=3584)     cuBLAS 比 FP16 GEMV 快 1.92×
     GEMV_FP16_ENABLED  = True   # 全局开关
     GEMV_FP16_MIN_N    = 9000   # N 阈值：大矩阵走 FP16 GEMV，小矩阵走 cuBLAS
     GEMV_FP16_BLOCK_N  = 128
@@ -892,7 +885,6 @@ class Linear:
     def _forward_gemv_fp16(self, x: torch.Tensor) -> torch.Tensor:
         """
         FP16 权重 GEMV（仅 M=1）。
-        N >= GEMV_FP16_MIN_N 时启用；否则回退 cuBLAS（更快）。
         """
         original_shape = x.shape
         batch_dims = original_shape[:-1]
@@ -902,7 +894,7 @@ class Linear:
         device = x.device
         self._prepare_fp16_weight(device)
 
-        x_vec = x.reshape(K).float().contiguous()     # [K] float32
+        x_vec = x.reshape(K).float.contiguous()    # [K] float32
         y_vec = torch.empty(N, dtype=torch.float32, device=device)
 
         grid = (triton.cdiv(N, self.GEMV_FP16_BLOCK_N),)
@@ -930,7 +922,7 @@ class Linear:
             if M == 1:
                 return self._forward_gemv_fp16(x)
                 
-        # ── 原有路由逻辑（prefill 及非 CUDA）──────────────────────────────
+        # ── 原有路由逻辑──────────────────────────────
         if Linear.BACKEND in ("torch", "cublas"):
             return self._forward_torch(x)
         if Linear.BACKEND == "triton":
