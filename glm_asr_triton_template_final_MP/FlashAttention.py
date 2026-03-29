@@ -175,14 +175,14 @@ if __name__ == "__main__":
         out_flash = flash_attention(q, k, v)
         out_ref   = reference_attention(q, k, v)
         diff = (out_flash - out_ref).abs().max().item()
-        status = "✅" if diff < 1e-2 else "❌"
+        status = "yes" if diff < 1e-2 else "no"
         print(f"{status} Basic    {desc}: max_diff={diff:.6f}")
 
         # Causal
         out_flash_c = flash_attention(q, k, v, is_causal=True)
         out_ref_c   = reference_attention(q, k, v, is_causal=True)
         diff_c = (out_flash_c - out_ref_c).abs().max().item()
-        status_c = "✅" if diff_c < 1e-2 else "❌"
+        status_c = "yes" if diff_c < 1e-2 else "no"
         print(f"{status_c} Causal   {desc}: max_diff={diff_c:.6f}")
 
     # Speed benchmark
